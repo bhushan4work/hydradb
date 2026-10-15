@@ -8,7 +8,7 @@ use super::topology_tail::GraphTopologyOverlay;
 use super::*;
 use crate::query::path_procedure::{
     NativePathDirection, NativePathNodeSelector, NativePathProcedure, NativePathProcedureKind,
-    NativePathProjection,
+    NativePathProjection, RecallCertColumn, RecallCertProcedure, RecallCertProjection,
 };
 use crate::QueryFailureReason;
 use crate::{
@@ -189,6 +189,320 @@ impl GraphShard {
             Some(cursor)
         };
         Ok(QueryResultPage::new(columns, rows, next_cursor))
+    }
+
+    pub(crate) async fn execute_recall_cert_rows_page(
+        &self,
+        context: QueryContext,
+        procedure: RecallCertProcedure,
+        cursor: Option<QueryCursorToken>,
+        page_size: usize,
+    ) -> Result<QueryResultPage> {
+        if page_size == 0 {
+            return Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::InvalidRequest,
+                dialect: "OpenCypher",
+                feature: "recall cert page size must be greater than zero".to_string(),
+            });
+        }
+        if cursor.is_some() {
+            return Ok(QueryResultPage::new(procedure.columns(), Vec::new(), None));
+        }
+        let result = self.execute_recall_cert_rows(context, procedure).await?;
+        let rows = if result.rows.is_empty() {
+            Vec::new()
+        } else {
+            result.rows
+        };
+        Ok(QueryResultPage::new(result.columns, rows, None))
+    }
+
+    pub(crate) async fn execute_recall_cert_rows(
+        &self,
+        context: QueryContext,
+        procedure: RecallCertProcedure,
+    ) -> Result<QueryResultSet> {
+        self.operation_metrics
+            .query_rows_started
+            .fetch_add(1, Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        let span = tracing::info_span!(
+            "query.execute",
+            hydradb.cell_id = %context.cell_id,
+            hydradb.query.access_path = "RecallCertProcedure",
+            hydradb.query.procedure = "algo.RecallCert",
+            hydradb.query.result_cache = tracing::field::Empty,
+            hydradb.read_epoch = tracing::field::Empty,
+            hydradb.query.rows_returned = tracing::field::Empty,
+            error.class = tracing::field::Empty,
+            error.operation = tracing::field::Empty,
+            hydradb.sampling.tail_keep = tracing::field::Empty,
+        );
+        let result = self
+            .execute_recall_cert_rows_snapshot(context, procedure)
+            .instrument(span.clone())
+            .await;
+        self.operation_metrics
+            .query_rows_latency
+            .record(started.elapsed());
+        match &result {
+            Ok(result_set) => {
+                self.operation_metrics
+                    .query_rows_completed
+                    .fetch_add(1, Ordering::Relaxed);
+                self.operation_metrics
+                    .query_rows_returned
+                    .fetch_add(result_set.rows.len() as u64, Ordering::Relaxed);
+                span.record("hydradb.query.rows_returned", result_set.rows.len() as u64);
+                if let Some(read_epoch) = result_set.read_epoch {
+                    span.record("hydradb.read_epoch", read_epoch);
+                }
+            }
+            Err(error) => {
+                self.operation_metrics.record_query_rows_failure(error);
+                span.record("error.class", error.class());
+                if let Some(operation) = error.limit_operation() {
+                    span.record("error.operation", operation);
+                }
+                span.record("hydradb.sampling.tail_keep", "error");
+            }
+        }
+        result
+    }
+
+    async fn execute_recall_cert_rows_snapshot(
+        &self,
+        context: QueryContext,
+        procedure: RecallCertProcedure,
+    ) -> Result<QueryResultSet> {
+        if context.read_epoch.is_some() && context.validated_read_epoch().is_none() {
+            return Err(GraphError::UnsupportedQuery {
+                reason: QueryFailureReason::InvalidRequest,
+                dialect: "OpenCypher",
+                feature: "historical graph epochs are not storage snapshots; execute against a current SlateDB snapshot"
+                    .to_string(),
+            });
+        }
+        if context.read_epoch.is_none() {
+            let snapshot = if context.uses_refreshed_reader() {
+                self.db.reader_snapshot().await?
+            } else {
+                self.db.snapshot().await?
+            };
+            let read_epoch = snapshot.seq();
+            let context = context.with_validated_storage_read_epoch(read_epoch, read_epoch);
+            return GraphStore::scope_snapshot(
+                snapshot,
+                self.execute_recall_cert_rows_inner(context, procedure),
+            )
+            .await;
+        }
+        self.execute_recall_cert_rows_inner(context, procedure)
+            .await
+    }
+
+    async fn execute_recall_cert_rows_inner(
+        &self,
+        context: QueryContext,
+        procedure: RecallCertProcedure,
+    ) -> Result<QueryResultSet> {
+        validate_component("cell_id", &context.cell_id)?;
+        let budget = QueryBudget::new(
+            context.max_runtime_ms.or(self.limits.max_query_runtime_ms),
+            context.cancellation_token.clone(),
+        )
+        .with_max_result_bytes(context.max_result_bytes);
+        budget.check("recall_cert_start")?;
+
+        let read_epoch = context
+            .validated_read_epoch()
+            .unwrap_or(self.current_epoch(&context.cell_id).await?);
+        let snapshot = self.db.snapshot().await?;
+        if snapshot.seq() != read_epoch {
+            return Err(GraphError::SnapshotAhead {
+                cell_id: context.cell_id,
+                read_epoch,
+                current_epoch: snapshot.seq(),
+            });
+        }
+
+        let result_cache_key = NativePathResultCacheKey {
+            scope: context.scope.clone(),
+            cell_id: context.cell_id.clone(),
+            procedure: format!("{procedure:?}"),
+            read_epoch,
+            max_result_bytes: context.max_result_bytes,
+        };
+        if let Some(cached) = self
+            .native_path_result_cache
+            .lock()
+            .await
+            .get(&result_cache_key)
+        {
+            tracing::Span::current().record("hydradb.query.result_cache", "hit");
+            let mut result = (*cached).clone();
+            result.storage_sequence = context.validated_storage_sequence();
+            return Ok(result);
+        }
+        tracing::Span::current().record("hydradb.query.result_cache", "miss");
+
+        let topologies = self
+            .recall_cert_topologies(&context.cell_id, &procedure.rel_type, read_epoch, &budget)
+            .await?;
+        let read = NativePathRead {
+            snapshot: snapshot.as_ref(),
+            cell_id: &context.cell_id,
+            read_epoch,
+            budget: &budget,
+        };
+
+        let distinct_labels: BTreeSet<VertexId> = procedure.label_nodes.iter().copied().collect();
+        let total = distinct_labels.len() as u64;
+
+        let (reached, recall, pass) = if total == 0 {
+            (0, 0.0, 0.0 >= procedure.threshold)
+        } else {
+            let distinct_sources: BTreeSet<VertexId> =
+                procedure.source_nodes.iter().copied().collect();
+            if distinct_sources.is_empty() || procedure.max_len == 0 {
+                (0, 0.0, 0.0 >= procedure.threshold)
+            } else {
+                let mut reached_labels = BTreeSet::new();
+                let mut visited = distinct_sources.clone();
+                let mut frontier = distinct_sources;
+                let mut edge_visits = 0_u64;
+
+                for _depth in 0..procedure.max_len {
+                    if frontier.is_empty() {
+                        break;
+                    }
+                    let mut next_frontier = BTreeSet::new();
+                    for vertex in frontier {
+                        read.budget.check("recall_cert_frontier")?;
+                        let (edges, scanned_edges) = self
+                            .native_path_successors(
+                                read,
+                                vertex,
+                                NativePathDirection::Outgoing,
+                                &topologies,
+                                None,
+                            )
+                            .await?;
+                        edge_visits = edge_visits.saturating_add(scanned_edges);
+                        if edge_visits > self.limits.max_query_scan_edges {
+                            return Err(GraphError::AdmissionRejected {
+                                operation: "native_path_edges",
+                                actual: edge_visits,
+                                limit: self.limits.max_query_scan_edges,
+                            });
+                        }
+                        for edge in edges {
+                            let neighbor = edge.dst;
+                            if distinct_labels.contains(&neighbor) {
+                                reached_labels.insert(neighbor);
+                            }
+                            if visited.insert(neighbor) {
+                                next_frontier.insert(neighbor);
+                            }
+                        }
+                    }
+                    if visited.len() > self.limits.max_query_intermediate_rows {
+                        return Err(GraphError::AdmissionRejected {
+                            operation: "native_path_vertices",
+                            actual: visited.len() as u64,
+                            limit: self.limits.max_query_intermediate_rows as u64,
+                        });
+                    }
+                    frontier = next_frontier;
+                }
+                let reached = reached_labels.len() as u64;
+                let recall = reached as f64 / total as f64;
+                let pass = recall >= procedure.threshold;
+                (reached, recall, pass)
+            }
+        };
+
+        let reached_val = QueryValue::Count(reached);
+        let total_val = QueryValue::Count(total);
+        let recall_val = QueryValue::Float(QueryFloat(recall));
+        let pass_val = QueryValue::Bool(pass);
+
+        let values = procedure
+            .projections
+            .iter()
+            .map(|proj| match proj {
+                RecallCertProjection::Yielded { column, .. } => match column {
+                    RecallCertColumn::Reached => reached_val.clone(),
+                    RecallCertColumn::Total => total_val.clone(),
+                    RecallCertColumn::Recall => recall_val.clone(),
+                    RecallCertColumn::Pass => pass_val.clone(),
+                },
+                RecallCertProjection::CountAll { .. } => QueryValue::Count(1),
+            })
+            .collect();
+
+        let row = QueryRow::new(values);
+        budget.account_result_row(&row)?;
+        let result =
+            QueryResultSet::new(procedure.columns(), vec![row]).with_read_epoch(read_epoch);
+        let result = match context.validated_storage_sequence() {
+            Some(sequence) => result.with_storage_sequence(sequence),
+            None => result,
+        };
+
+        let resident_bytes = result_cache_key
+            .estimated_resident_bytes()
+            .saturating_add(native_path_result_resident_bytes(&result));
+        self.native_path_result_cache.lock().await.insert_sized(
+            result_cache_key,
+            Arc::new(result.clone()),
+            context.cell_id,
+            false,
+            resident_bytes,
+            &self.cache_metrics,
+        );
+        Ok(result)
+    }
+
+    async fn recall_cert_topologies(
+        &self,
+        cell_id: &str,
+        rel_type: &str,
+        read_epoch: StorageSequence,
+        budget: &QueryBudget,
+    ) -> Result<Vec<TypedPathTopology>> {
+        budget.check("recall_cert_artifact_lookup")?;
+        let source = if crate::sparse_kernel::default_matrix_kernel(&self.cache_policy)
+            == SparseKernelBackend::Adjacency
+        {
+            PathTopologySource::Storage
+        } else if let Some(artifact) = self
+            .traced_latest_matrix_artifact(cell_id, rel_type, read_epoch)
+            .await?
+        {
+            match self
+                .compiled_graphblas_query_snapshot(
+                    cell_id,
+                    rel_type,
+                    artifact.base_epoch,
+                    read_epoch,
+                    budget,
+                )
+                .await?
+            {
+                Some((matrix, overlay, rebuilt)) => {
+                    self.record_graphblas_snapshot(rebuilt);
+                    PathTopologySource::Compiled { matrix, overlay }
+                }
+                None => PathTopologySource::Storage,
+            }
+        } else {
+            PathTopologySource::Storage
+        };
+        Ok(vec![TypedPathTopology {
+            edge_type: rel_type.to_string(),
+            source,
+        }])
     }
 
     pub(crate) async fn execute_native_path_rows(

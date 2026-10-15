@@ -4,6 +4,73 @@ use crate::QueryFailureReason;
 use crate::{GraphError, QueryColumn, QueryFloat, Result, VertexId, VertexPropertyValue};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecallCertColumn {
+    Reached,
+    Total,
+    Recall,
+    Pass,
+}
+
+impl RecallCertColumn {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Reached => "reached",
+            Self::Total => "total",
+            Self::Recall => "recall",
+            Self::Pass => "pass",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RecallCertProjection {
+    Yielded {
+        column: RecallCertColumn,
+        alias: Option<String>,
+    },
+    CountAll {
+        alias: Option<String>,
+    },
+}
+
+impl RecallCertProjection {
+    pub(crate) fn column(&self) -> QueryColumn {
+        match self {
+            Self::Yielded { column, alias } => {
+                QueryColumn::new(alias.as_deref().unwrap_or_else(|| column.name()))
+            }
+            Self::CountAll { alias } => QueryColumn::new(alias.as_deref().unwrap_or("count(*)")),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RecallCertProcedure {
+    pub(crate) source_nodes: Vec<VertexId>,
+    pub(crate) label_nodes: Vec<VertexId>,
+    pub(crate) rel_type: String,
+    pub(crate) max_len: u8,
+    pub(crate) threshold: f64,
+    pub(crate) projections: Vec<RecallCertProjection>,
+}
+
+impl RecallCertProcedure {
+    pub(crate) fn is_count_all(&self) -> bool {
+        matches!(
+            self.projections.as_slice(),
+            [RecallCertProjection::CountAll { .. }]
+        )
+    }
+
+    pub(crate) fn columns(&self) -> Vec<QueryColumn> {
+        self.projections
+            .iter()
+            .map(RecallCertProjection::column)
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NativePathProcedureKind {
     SinglePair,
     SingleSource,
@@ -251,13 +318,481 @@ pub(crate) fn parse_native_path_procedure(
 
 #[cfg(feature = "client-api")]
 pub(crate) fn parse_native_path_procedure_columns(query: &str) -> Result<Option<Vec<QueryColumn>>> {
-    Ok(parse_native_path_call(query)?.map(|parsed| {
-        parsed
-            .projections
-            .into_iter()
-            .map(NativePathProjection::column)
-            .collect()
+    if let Some(parsed) = parse_native_path_call(query)? {
+        return Ok(Some(
+            parsed
+                .projections
+                .into_iter()
+                .map(NativePathProjection::column)
+                .collect(),
+        ));
+    }
+    if let Some(parsed) = parse_recall_cert_call(query)? {
+        return Ok(Some(
+            parsed
+                .projections
+                .iter()
+                .map(RecallCertProjection::column)
+                .collect(),
+        ));
+    }
+    Ok(None)
+}
+
+#[derive(Clone, Debug)]
+struct ParsedRecallCertCall {
+    source_nodes: ConfigValue,
+    label_nodes: ConfigValue,
+    rel_type: ConfigValue,
+    max_len: ConfigValue,
+    threshold: ConfigValue,
+    projections: Vec<RecallCertProjection>,
+}
+
+pub(crate) fn parse_recall_cert_procedure(
+    query: &str,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+    list_parameters: &BTreeMap<String, Vec<VertexPropertyValue>>,
+    max_traversal_hops: u8,
+) -> Result<Option<RecallCertProcedure>> {
+    let Some(parsed) = parse_recall_cert_call(query)? else {
+        return Ok(None);
+    };
+    let source_nodes = resolve_node_list(
+        &parsed.source_nodes,
+        "sourceNodes",
+        parameters,
+        list_parameters,
+    )?;
+    let label_nodes = resolve_node_list(
+        &parsed.label_nodes,
+        "labelNodes",
+        parameters,
+        list_parameters,
+    )?;
+    let rel_type = resolve_rel_type(&parsed.rel_type, "relType", parameters)?;
+    let max_len = resolve_max_len(&parsed.max_len, "maxLen", parameters, max_traversal_hops)?;
+    let threshold = resolve_threshold(&parsed.threshold, "threshold", parameters)?;
+
+    Ok(Some(RecallCertProcedure {
+        source_nodes,
+        label_nodes,
+        rel_type,
+        max_len,
+        threshold,
+        projections: parsed.projections,
     }))
+}
+
+fn parse_recall_cert_call(query: &str) -> Result<Option<ParsedRecallCertCall>> {
+    if !is_native_path_procedure(query) {
+        return Ok(None);
+    }
+    let mut parser = Parser::new(query)?;
+    parser.keyword("CALL")?;
+    parser.identifier_eq("algo")?;
+    parser.token(Token::Dot)?;
+    let procedure = parser.identifier()?;
+    if !procedure.eq_ignore_ascii_case("RecallCert") {
+        return Ok(None);
+    }
+    parser.token(Token::LeftParen)?;
+    let (source_nodes, label_nodes, rel_type, max_len, threshold) = if parser
+        .optional(Token::LeftBrace)
+    {
+        let mut config = BTreeMap::new();
+        if !parser.optional(Token::RightBrace) {
+            loop {
+                let key = parser.identifier()?;
+                parser.token(Token::Colon)?;
+                let value = parser.value()?;
+                if config.insert(key.clone(), value).is_some() {
+                    return path_parse_error(format!("duplicate recall cert option {key}"));
+                }
+                if parser.optional(Token::RightBrace) {
+                    break;
+                }
+                parser.token(Token::Comma)?;
+            }
+        }
+        let source_nodes =
+            config
+                .remove("sourceNodes")
+                .ok_or_else(|| GraphError::MissingQueryParameter {
+                    dialect: "OpenCypher",
+                    name: "sourceNodes".to_string(),
+                })?;
+        let label_nodes =
+            config
+                .remove("labelNodes")
+                .ok_or_else(|| GraphError::MissingQueryParameter {
+                    dialect: "OpenCypher",
+                    name: "labelNodes".to_string(),
+                })?;
+        let rel_type =
+            config
+                .remove("relType")
+                .ok_or_else(|| GraphError::MissingQueryParameter {
+                    dialect: "OpenCypher",
+                    name: "relType".to_string(),
+                })?;
+        let max_len = config
+            .remove("maxLen")
+            .ok_or_else(|| GraphError::MissingQueryParameter {
+                dialect: "OpenCypher",
+                name: "maxLen".to_string(),
+            })?;
+        let threshold =
+            config
+                .remove("threshold")
+                .ok_or_else(|| GraphError::MissingQueryParameter {
+                    dialect: "OpenCypher",
+                    name: "threshold".to_string(),
+                })?;
+        if let Some(unknown) = config.keys().next() {
+            return path_parse_error(format!("unknown recall cert option {unknown}"));
+        }
+        (source_nodes, label_nodes, rel_type, max_len, threshold)
+    } else {
+        let source_nodes = parser.value()?;
+        parser.token(Token::Comma)?;
+        let label_nodes = parser.value()?;
+        parser.token(Token::Comma)?;
+        let rel_type = parser.value()?;
+        parser.token(Token::Comma)?;
+        let max_len = parser.value()?;
+        parser.token(Token::Comma)?;
+        let threshold = parser.value()?;
+        (source_nodes, label_nodes, rel_type, max_len, threshold)
+    };
+    parser.token(Token::RightParen)?;
+    parser.keyword("YIELD")?;
+    let yielded_columns = if parser.optional(Token::Star) {
+        vec![
+            RecallCertColumn::Reached,
+            RecallCertColumn::Total,
+            RecallCertColumn::Recall,
+            RecallCertColumn::Pass,
+        ]
+    } else {
+        let mut cols = Vec::new();
+        loop {
+            let name = parser.identifier()?;
+            let col = match name.to_ascii_lowercase().as_str() {
+                "reached" => RecallCertColumn::Reached,
+                "total" => RecallCertColumn::Total,
+                "recall" => RecallCertColumn::Recall,
+                "pass" => RecallCertColumn::Pass,
+                other => return path_parse_error(format!("unknown recall cert column {other}")),
+            };
+            if cols.contains(&col) {
+                return path_parse_error(format!("duplicate yield column {name}"));
+            }
+            cols.push(col);
+            if !parser.optional(Token::Comma) {
+                break;
+            }
+        }
+        cols
+    };
+
+    let projections = if parser.optional_keyword("RETURN") {
+        if parser.optional(Token::Star) {
+            yielded_columns
+                .into_iter()
+                .map(|col| RecallCertProjection::Yielded {
+                    column: col,
+                    alias: None,
+                })
+                .collect()
+        } else {
+            let mut projs = Vec::new();
+            loop {
+                if parser.peek().is_some_and(|t| match t {
+                    Token::Identifier(s) => s.eq_ignore_ascii_case("count"),
+                    _ => false,
+                }) && parser.tokens.get(parser.offset + 1) == Some(&Token::LeftParen)
+                    && parser.tokens.get(parser.offset + 2) == Some(&Token::Star)
+                    && parser.tokens.get(parser.offset + 3) == Some(&Token::RightParen)
+                {
+                    parser.offset += 4;
+                    let alias = if parser.optional_keyword("AS") {
+                        Some(parser.identifier()?)
+                    } else {
+                        None
+                    };
+                    projs.push(RecallCertProjection::CountAll { alias });
+                } else {
+                    let name = parser.identifier()?;
+                    let col = match name.to_ascii_lowercase().as_str() {
+                        "reached" => RecallCertColumn::Reached,
+                        "total" => RecallCertColumn::Total,
+                        "recall" => RecallCertColumn::Recall,
+                        "pass" => RecallCertColumn::Pass,
+                        other => {
+                            return path_parse_error(format!("unknown recall cert column {other}"))
+                        }
+                    };
+                    if !yielded_columns.contains(&col) {
+                        return path_parse_error("RETURN may only reference yielded columns");
+                    }
+                    let alias = if parser.optional_keyword("AS") {
+                        Some(parser.identifier()?)
+                    } else {
+                        None
+                    };
+                    projs.push(RecallCertProjection::Yielded { column: col, alias });
+                }
+                if !parser.optional(Token::Comma) {
+                    break;
+                }
+            }
+            projs
+        }
+    } else {
+        yielded_columns
+            .into_iter()
+            .map(|col| RecallCertProjection::Yielded {
+                column: col,
+                alias: None,
+            })
+            .collect()
+    };
+
+    parser.optional(Token::Semicolon);
+    parser.end()?;
+
+    Ok(Some(ParsedRecallCertCall {
+        source_nodes,
+        label_nodes,
+        rel_type,
+        max_len,
+        threshold,
+        projections,
+    }))
+}
+
+fn resolve_node_list(
+    value: &ConfigValue,
+    name: &str,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+    list_parameters: &BTreeMap<String, Vec<VertexPropertyValue>>,
+) -> Result<Vec<VertexId>> {
+    match value {
+        ConfigValue::List(items) => {
+            let mut result = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    ConfigValue::Integer(id) => {
+                        result.push(non_negative_u64(*id, name)?);
+                    }
+                    ConfigValue::Parameter(param) => {
+                        let prop = parameters.get(param).ok_or_else(|| {
+                            GraphError::MissingQueryParameter {
+                                dialect: "OpenCypher",
+                                name: param.clone(),
+                            }
+                        })?;
+                        match prop {
+                            VertexPropertyValue::Integer(id) => {
+                                result.push(*id);
+                            }
+                            VertexPropertyValue::SignedInteger(id) => {
+                                result.push(non_negative_u64(*id, name)?);
+                            }
+                            _ => {
+                                return path_parse_error(format!(
+                                    "{name} must contain integer node ids"
+                                ))
+                            }
+                        }
+                    }
+                    _ => return path_parse_error(format!("{name} must contain integer node ids")),
+                }
+            }
+            Ok(result)
+        }
+        ConfigValue::Parameter(param) => {
+            if let Some(list) = list_parameters.get(param) {
+                let mut result = Vec::with_capacity(list.len());
+                for prop in list {
+                    match prop {
+                        VertexPropertyValue::Integer(id) => {
+                            result.push(*id);
+                        }
+                        VertexPropertyValue::SignedInteger(id) => {
+                            result.push(non_negative_u64(*id, name)?);
+                        }
+                        _ => {
+                            return path_parse_error(format!(
+                                "{name} must contain integer node ids"
+                            ))
+                        }
+                    }
+                }
+                return Ok(result);
+            }
+            if let Some(prop) = parameters.get(param) {
+                match prop {
+                    VertexPropertyValue::Integer(id) => return Ok(vec![*id]),
+                    VertexPropertyValue::SignedInteger(id) => {
+                        return Ok(vec![non_negative_u64(*id, name)?]);
+                    }
+                    _ => {
+                        return path_parse_error(format!(
+                            "{name} must be an integer or list of integer node ids"
+                        ))
+                    }
+                }
+            }
+            Err(GraphError::MissingQueryParameter {
+                dialect: "OpenCypher",
+                name: param.clone(),
+            })
+        }
+        ConfigValue::Identifier(ident) => {
+            if let Some(list) = list_parameters.get(ident) {
+                let mut result = Vec::with_capacity(list.len());
+                for prop in list {
+                    match prop {
+                        VertexPropertyValue::Integer(id) => {
+                            result.push(*id);
+                        }
+                        VertexPropertyValue::SignedInteger(id) => {
+                            result.push(non_negative_u64(*id, name)?);
+                        }
+                        _ => {
+                            return path_parse_error(format!(
+                                "{name} must contain integer node ids"
+                            ))
+                        }
+                    }
+                }
+                return Ok(result);
+            }
+            if let Some(prop) = parameters.get(ident) {
+                match prop {
+                    VertexPropertyValue::Integer(id) => return Ok(vec![*id]),
+                    VertexPropertyValue::SignedInteger(id) => {
+                        return Ok(vec![non_negative_u64(*id, name)?]);
+                    }
+                    _ => {
+                        return path_parse_error(format!(
+                            "{name} must be an integer or list of integer node ids"
+                        ))
+                    }
+                }
+            }
+            path_parse_error(format!("{name} must be a list of integer node ids"))
+        }
+        ConfigValue::Integer(id) => Ok(vec![non_negative_u64(*id, name)?]),
+        _ => path_parse_error(format!("{name} must be a list of integer node ids")),
+    }
+}
+
+fn resolve_rel_type(
+    value: &ConfigValue,
+    name: &str,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<String> {
+    let rel_type = match value {
+        ConfigValue::String(s) => s.clone(),
+        ConfigValue::Identifier(s) => {
+            if let Some(VertexPropertyValue::String(val)) = parameters.get(s) {
+                val.clone()
+            } else {
+                s.clone()
+            }
+        }
+        ConfigValue::Parameter(param) => match parameters.get(param) {
+            Some(VertexPropertyValue::String(s)) => s.clone(),
+            Some(_) => return path_parse_error(format!("{name} parameter must be a string")),
+            None => {
+                return Err(GraphError::MissingQueryParameter {
+                    dialect: "OpenCypher",
+                    name: param.clone(),
+                })
+            }
+        },
+        _ => return path_parse_error(format!("{name} must be a string or identifier")),
+    };
+    if rel_type.is_empty() {
+        return path_parse_error(format!("{name} must be a non-empty string"));
+    }
+    crate::validate_component("edge_type", &rel_type)?;
+    Ok(rel_type)
+}
+
+fn resolve_max_len(
+    value: &ConfigValue,
+    name: &str,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+    max_traversal_hops: u8,
+) -> Result<u8> {
+    let max_len_u64 = match value {
+        ConfigValue::Integer(i) => non_negative_u64(*i, name)?,
+        ConfigValue::Parameter(param) => match parameters.get(param) {
+            Some(VertexPropertyValue::Integer(i)) => *i,
+            Some(VertexPropertyValue::SignedInteger(i)) => non_negative_u64(*i, name)?,
+            Some(_) => return path_parse_error(format!("{name} parameter must be an integer")),
+            None => {
+                return Err(GraphError::MissingQueryParameter {
+                    dialect: "OpenCypher",
+                    name: param.clone(),
+                })
+            }
+        },
+        ConfigValue::Identifier(ident) => match parameters.get(ident) {
+            Some(VertexPropertyValue::Integer(i)) => *i,
+            Some(VertexPropertyValue::SignedInteger(i)) => non_negative_u64(*i, name)?,
+            Some(_) => return path_parse_error(format!("{name} parameter must be an integer")),
+            None => return path_parse_error(format!("{name} must be a non-negative integer")),
+        },
+        _ => return path_parse_error(format!("{name} must be a non-negative integer")),
+    };
+    if max_len_u64 > u64::from(max_traversal_hops) {
+        return Err(GraphError::AdmissionRejected {
+            operation: "native_path_max_len",
+            actual: max_len_u64,
+            limit: u64::from(max_traversal_hops),
+        });
+    }
+    Ok(max_len_u64 as u8)
+}
+
+fn resolve_threshold(
+    value: &ConfigValue,
+    name: &str,
+    parameters: &BTreeMap<String, VertexPropertyValue>,
+) -> Result<f64> {
+    let t = match value {
+        ConfigValue::Float(f) => *f,
+        ConfigValue::Integer(i) => *i as f64,
+        ConfigValue::Parameter(param) => match parameters.get(param) {
+            Some(VertexPropertyValue::Float(f)) => f.0,
+            Some(VertexPropertyValue::Integer(i)) => *i as f64,
+            Some(VertexPropertyValue::SignedInteger(i)) => *i as f64,
+            Some(_) => return path_parse_error(format!("{name} parameter must be numeric")),
+            None => {
+                return Err(GraphError::MissingQueryParameter {
+                    dialect: "OpenCypher",
+                    name: param.clone(),
+                })
+            }
+        },
+        ConfigValue::Identifier(ident) => match parameters.get(ident) {
+            Some(VertexPropertyValue::Float(f)) => f.0,
+            Some(VertexPropertyValue::Integer(i)) => *i as f64,
+            Some(VertexPropertyValue::SignedInteger(i)) => *i as f64,
+            Some(_) => return path_parse_error(format!("{name} parameter must be numeric")),
+            None => return path_parse_error(format!("{name} must be numeric")),
+        },
+        _ => return path_parse_error(format!("{name} must be numeric")),
+    };
+    if !t.is_finite() || !(0.0..=1.0).contains(&t) {
+        return path_parse_error(format!("{name} must be finite and between 0.0 and 1.0"));
+    }
+    Ok(t)
 }
 
 fn parse_native_path_call(query: &str) -> Result<Option<ParsedNativePathCall>> {
@@ -562,6 +1097,7 @@ enum Token {
     Comma,
     Dot,
     Semicolon,
+    Star,
 }
 
 struct Parser {
@@ -616,6 +1152,9 @@ impl Parser {
                         return Ok(ConfigValue::List(values));
                     }
                     self.token(Token::Comma)?;
+                    if self.optional(Token::RightBracket) {
+                        return Ok(ConfigValue::List(values));
+                    }
                 }
             }
             token => path_parse_error(format!("unexpected native path value {token:?}")),
@@ -679,6 +1218,20 @@ impl Parser {
         }
     }
 
+    fn optional_keyword(&mut self, expected: &str) -> bool {
+        if let Some(Token::Identifier(value)) = self.tokens.get(self.offset) {
+            if value.eq_ignore_ascii_case(expected) {
+                self.offset += 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.offset)
+    }
+
     fn next(&mut self) -> Result<Token> {
         let token =
             self.tokens
@@ -722,6 +1275,7 @@ fn lex(query: &str) -> Result<Vec<Token>> {
             ',' => Some(Token::Comma),
             '.' => Some(Token::Dot),
             ';' => Some(Token::Semicolon),
+            '*' => Some(Token::Star),
             _ => None,
         };
         if let Some(token) = punctuation {
@@ -925,5 +1479,169 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, GraphError::AdmissionRejected { .. }));
+    }
+
+    #[test]
+    fn parses_recall_cert_positional_call_and_columns() {
+        let query = "CALL algo.RecallCert([1, 2], [3, 4, 5], 'FOLLOWS', 3, 0.8) YIELD reached, total, recall, pass";
+        let parsed = parse_recall_cert_procedure(query, &BTreeMap::new(), &BTreeMap::new(), 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.source_nodes, vec![1, 2]);
+        assert_eq!(parsed.label_nodes, vec![3, 4, 5]);
+        assert_eq!(parsed.rel_type, "FOLLOWS");
+        assert_eq!(parsed.max_len, 3);
+        assert!((parsed.threshold - 0.8).abs() < f64::EPSILON);
+        assert!(!parsed.is_count_all());
+        let col_names: Vec<String> = parsed.columns().into_iter().map(|c| c.name).collect();
+        assert_eq!(col_names, vec!["reached", "total", "recall", "pass"]);
+    }
+
+    #[test]
+    fn parses_recall_cert_map_call() {
+        let query = "CALL algo.RecallCert({sourceNodes: [10], labelNodes: [20, 30], relType: 'KNOWS', maxLen: 2, threshold: 0.5}) YIELD reached, pass";
+        let parsed = parse_recall_cert_procedure(query, &BTreeMap::new(), &BTreeMap::new(), 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.source_nodes, vec![10]);
+        assert_eq!(parsed.label_nodes, vec![20, 30]);
+        assert_eq!(parsed.rel_type, "KNOWS");
+        assert_eq!(parsed.max_len, 2);
+        assert!((parsed.threshold - 0.5).abs() < f64::EPSILON);
+        let col_names: Vec<String> = parsed.columns().into_iter().map(|c| c.name).collect();
+        assert_eq!(col_names, vec!["reached", "pass"]);
+    }
+
+    #[test]
+    fn parses_recall_cert_yield_star_and_aliases() {
+        let query = "CALL algo.RecallCert([1], [2], 'FOLLOWS', 1, 0.5) YIELD * RETURN recall AS metric, pass";
+        let parsed = parse_recall_cert_procedure(query, &BTreeMap::new(), &BTreeMap::new(), 10)
+            .unwrap()
+            .unwrap();
+        let col_names: Vec<String> = parsed.columns().into_iter().map(|c| c.name).collect();
+        assert_eq!(col_names, vec!["metric", "pass"]);
+    }
+
+    #[test]
+    fn parses_recall_cert_count_star() {
+        let query1 =
+            "CALL algo.RecallCert([1], [2], 'FOLLOWS', 1, 0.5) YIELD reached RETURN count(*)";
+        let parsed1 = parse_recall_cert_procedure(query1, &BTreeMap::new(), &BTreeMap::new(), 10)
+            .unwrap()
+            .unwrap();
+        assert!(parsed1.is_count_all());
+        let col_names1: Vec<String> = parsed1.columns().into_iter().map(|c| c.name).collect();
+        assert_eq!(col_names1, vec!["count(*)"]);
+
+        let query2 = "CALL algo.RecallCert([1], [2], 'FOLLOWS', 1, 0.5) YIELD reached, total RETURN count(*) AS num_rows";
+        let parsed2 = parse_recall_cert_procedure(query2, &BTreeMap::new(), &BTreeMap::new(), 10)
+            .unwrap()
+            .unwrap();
+        assert!(parsed2.is_count_all());
+        let col_names2: Vec<String> = parsed2.columns().into_iter().map(|c| c.name).collect();
+        assert_eq!(col_names2, vec!["num_rows"]);
+    }
+
+    #[test]
+    fn parses_recall_cert_parameters_and_list_parameters() {
+        let mut params = BTreeMap::new();
+        params.insert(
+            "rel".to_string(),
+            VertexPropertyValue::String("CONNECTS".to_string()),
+        );
+        params.insert("len".to_string(), VertexPropertyValue::Integer(4));
+        params.insert(
+            "thresh".to_string(),
+            VertexPropertyValue::Float(crate::QueryFloat(0.75)),
+        );
+        params.insert("single_src".to_string(), VertexPropertyValue::Integer(42));
+
+        let mut list_params = BTreeMap::new();
+        list_params.insert(
+            "label_list".to_string(),
+            vec![
+                VertexPropertyValue::Integer(100),
+                VertexPropertyValue::Integer(101),
+            ],
+        );
+
+        let query = "CALL algo.RecallCert($single_src, $label_list, $rel, $len, $thresh) YIELD reached, total, recall, pass";
+        let parsed = parse_recall_cert_procedure(query, &params, &list_params, 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.source_nodes, vec![42]);
+        assert_eq!(parsed.label_nodes, vec![100, 101]);
+        assert_eq!(parsed.rel_type, "CONNECTS");
+        assert_eq!(parsed.max_len, 4);
+        assert!((parsed.threshold - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rejects_recall_cert_invalid_threshold() {
+        let query_neg = "CALL algo.RecallCert([1], [2], 'R', 1, -0.1) YIELD reached";
+        assert!(
+            parse_recall_cert_procedure(query_neg, &BTreeMap::new(), &BTreeMap::new(), 10).is_err()
+        );
+
+        let query_over = "CALL algo.RecallCert([1], [2], 'R', 1, 1.1) YIELD reached";
+        assert!(
+            parse_recall_cert_procedure(query_over, &BTreeMap::new(), &BTreeMap::new(), 10)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_recall_cert_max_len_exceeding_hop_budget() {
+        let query = "CALL algo.RecallCert([1], [2], 'R', 11, 0.5) YIELD reached";
+        let error =
+            parse_recall_cert_procedure(query, &BTreeMap::new(), &BTreeMap::new(), 10).unwrap_err();
+        assert!(matches!(error, GraphError::AdmissionRejected { .. }));
+    }
+
+    #[test]
+    fn rejects_recall_cert_negative_or_invalid_node_ids() {
+        let query_neg = "CALL algo.RecallCert([-1], [2], 'R', 1, 0.5) YIELD reached";
+        assert!(
+            parse_recall_cert_procedure(query_neg, &BTreeMap::new(), &BTreeMap::new(), 10).is_err()
+        );
+
+        let query_str = "CALL algo.RecallCert(['abc'], [2], 'R', 1, 0.5) YIELD reached";
+        assert!(
+            parse_recall_cert_procedure(query_str, &BTreeMap::new(), &BTreeMap::new(), 10).is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_recall_cert_empty_or_invalid_rel_type() {
+        let query_empty = "CALL algo.RecallCert([1], [2], '', 1, 0.5) YIELD reached";
+        assert!(
+            parse_recall_cert_procedure(query_empty, &BTreeMap::new(), &BTreeMap::new(), 10)
+                .is_err()
+        );
+
+        let query_invalid = "CALL algo.RecallCert([1], [2], 'bad/rel', 1, 0.5) YIELD reached";
+        assert!(
+            parse_recall_cert_procedure(query_invalid, &BTreeMap::new(), &BTreeMap::new(), 10)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_recall_cert_missing_or_unknown_columns() {
+        let query_unknown = "CALL algo.RecallCert([1], [2], 'R', 1, 0.5) YIELD unknown";
+        assert!(
+            parse_recall_cert_procedure(query_unknown, &BTreeMap::new(), &BTreeMap::new(), 10)
+                .is_err()
+        );
+
+        let query_non_yielded =
+            "CALL algo.RecallCert([1], [2], 'R', 1, 0.5) YIELD reached RETURN total";
+        assert!(parse_recall_cert_procedure(
+            query_non_yielded,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            10
+        )
+        .is_err());
     }
 }

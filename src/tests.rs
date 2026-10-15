@@ -2756,6 +2756,445 @@ fn native_path_target(row: &QueryRow) -> VertexId {
     }
 }
 
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn recall_cert_reachability_hop_boundaries_direction_and_type_filtering() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/recall-cert-reachability";
+    let shard = open_test_shard(path, object_store).await;
+
+    // 1 -[:FOLLOWS]-> 2 -[:FOLLOWS]-> 3 -[:FOLLOWS]-> 4
+    // 5 -[:FOLLOWS]-> 1 (incoming to 1, should NOT be traversed)
+    // 1 -[:OTHER]-> 6 (different relType, should NOT be traversed)
+    shard
+        .write_edge(typed_mutation("cell-a", "FOLLOWS", 1, 2, "e1"))
+        .await
+        .unwrap();
+    shard
+        .write_edge(typed_mutation("cell-a", "FOLLOWS", 2, 3, "e2"))
+        .await
+        .unwrap();
+    shard
+        .write_edge(typed_mutation("cell-a", "FOLLOWS", 3, 4, "e3"))
+        .await
+        .unwrap();
+    shard
+        .write_edge(typed_mutation("cell-a", "FOLLOWS", 5, 1, "e4"))
+        .await
+        .unwrap();
+    shard
+        .write_edge(typed_mutation("cell-a", "OTHER", 1, 6, "e5"))
+        .await
+        .unwrap();
+
+    // Test 1 hop: only node 2 is reached within 1 hop.
+    // 3, 4 require > 1 hop. 5 is incoming. 6 is OTHER type.
+    // labelNodes: [2, 3, 4, 5, 6]. total = 5.
+    // reached = 1. recall = 1/5 = 0.2.
+    // threshold = 0.2 -> pass should be true (tests threshold equality).
+    let q1 = "CALL algo.RecallCert([1], [2, 3, 4, 5, 6], 'FOLLOWS', 1, 0.2) YIELD reached, total, recall, pass";
+    let r1 = shard
+        .execute_cypher_rows(QueryContext::new("cell-a", "q1"), q1)
+        .await
+        .unwrap();
+    let col_names: Vec<&str> = r1.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(col_names, vec!["reached", "total", "recall", "pass"]);
+    assert_eq!(r1.rows.len(), 1);
+    assert_eq!(r1.rows[0].values[0], QueryValue::Count(1));
+    assert_eq!(r1.rows[0].values[1], QueryValue::Count(5));
+    assert_eq!(r1.rows[0].values[2], QueryValue::Float(QueryFloat(0.2)));
+    assert_eq!(r1.rows[0].values[3], QueryValue::Bool(true));
+
+    // Test 2 hops: nodes 2 and 3 are reached.
+    // reached = 2. total = 5. recall = 2/5 = 0.4.
+    // threshold = 0.2 -> pass = true.
+    let q2 = "CALL algo.RecallCert([1], [2, 3, 4, 5, 6], 'FOLLOWS', 2, 0.2) YIELD reached, total, recall, pass";
+    let r2 = shard
+        .execute_cypher_rows(QueryContext::new("cell-a", "q2"), q2)
+        .await
+        .unwrap();
+    assert_eq!(r2.rows[0].values[0], QueryValue::Count(2));
+    assert_eq!(r2.rows[0].values[1], QueryValue::Count(5));
+    assert_eq!(r2.rows[0].values[2], QueryValue::Float(QueryFloat(0.4)));
+    assert_eq!(r2.rows[0].values[3], QueryValue::Bool(true));
+
+    // Test 3 hops: nodes 2, 3, 4 are reached.
+    // reached = 3. total = 5. recall = 3/5 = 0.6.
+    // threshold = 0.6 -> pass = true.
+    let q3 = "CALL algo.RecallCert([1], [2, 3, 4, 5, 6], 'FOLLOWS', 3, 0.6) YIELD reached, total, recall, pass";
+    let r3 = shard
+        .execute_cypher_rows(QueryContext::new("cell-a", "q3"), q3)
+        .await
+        .unwrap();
+    assert_eq!(r3.rows[0].values[0], QueryValue::Count(3));
+    assert_eq!(r3.rows[0].values[1], QueryValue::Count(5));
+    assert_eq!(r3.rows[0].values[2], QueryValue::Float(QueryFloat(0.6)));
+    assert_eq!(r3.rows[0].values[3], QueryValue::Bool(true));
+
+    // Test pass/fail outcome: same 3 hops, but threshold = 0.61 -> pass should be false.
+    let q4 = "CALL algo.RecallCert([1], [2, 3, 4, 5, 6], 'FOLLOWS', 3, 0.61) YIELD reached, total, recall, pass";
+    let r4 = shard
+        .execute_cypher_rows(QueryContext::new("cell-a", "q4"), q4)
+        .await
+        .unwrap();
+    assert_eq!(r4.rows[0].values[0], QueryValue::Count(3));
+    assert_eq!(r4.rows[0].values[1], QueryValue::Count(5));
+    assert_eq!(r4.rows[0].values[2], QueryValue::Float(QueryFloat(0.6)));
+    assert_eq!(r4.rows[0].values[3], QueryValue::Bool(false));
+
+    // Test direction specifically: node 5 is upstream (5 -> 1). From 1, 5 cannot be reached.
+    let q_dir =
+        "CALL algo.RecallCert([1], [5], 'FOLLOWS', 3, 0.5) YIELD reached, total, recall, pass";
+    let r_dir = shard
+        .execute_cypher_rows(QueryContext::new("cell-a", "q_dir"), q_dir)
+        .await
+        .unwrap();
+    assert_eq!(r_dir.rows[0].values[0], QueryValue::Count(0));
+    assert_eq!(r_dir.rows[0].values[1], QueryValue::Count(1));
+    assert_eq!(r_dir.rows[0].values[2], QueryValue::Float(QueryFloat(0.0)));
+    assert_eq!(r_dir.rows[0].values[3], QueryValue::Bool(false));
+
+    // Test rel-type filtering specifically: node 6 is connected via OTHER.
+    let q_rel =
+        "CALL algo.RecallCert([1], [6], 'FOLLOWS', 3, 0.5) YIELD reached, total, recall, pass";
+    let r_rel = shard
+        .execute_cypher_rows(QueryContext::new("cell-a", "q_rel"), q_rel)
+        .await
+        .unwrap();
+    assert_eq!(r_rel.rows[0].values[0], QueryValue::Count(0));
+    assert_eq!(r_rel.rows[0].values[1], QueryValue::Count(1));
+    assert_eq!(r_rel.rows[0].values[2], QueryValue::Float(QueryFloat(0.0)));
+    assert_eq!(r_rel.rows[0].values[3], QueryValue::Bool(false));
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn recall_cert_multiple_sources_paths_and_duplicate_counting() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/recall-cert-multi-source";
+    let shard = open_test_shard(path, object_store).await;
+
+    // Multiple paths to 30:
+    // 10 -> 20 -> 30
+    // 11 -> 21 -> 30
+    // 11 -> 30
+    // 40 is disconnected
+    shard
+        .write_edge(typed_mutation("cell-a", "LINK", 10, 20, "e1"))
+        .await
+        .unwrap();
+    shard
+        .write_edge(typed_mutation("cell-a", "LINK", 20, 30, "e2"))
+        .await
+        .unwrap();
+    shard
+        .write_edge(typed_mutation("cell-a", "LINK", 11, 21, "e3"))
+        .await
+        .unwrap();
+    shard
+        .write_edge(typed_mutation("cell-a", "LINK", 21, 30, "e4"))
+        .await
+        .unwrap();
+    shard
+        .write_edge(typed_mutation("cell-a", "LINK", 11, 30, "e5"))
+        .await
+        .unwrap();
+
+    // Query with duplicate sources [10, 11, 10, 11] and duplicate labels [30, 30, 30, 40]
+    // Unique sources: {10, 11}. Unique labels: {30, 40} -> total = 2.
+    // 30 reached through multiple paths and sources -> counted once -> reached = 1.
+    // 40 not reached.
+    // recall = 1/2 = 0.5.
+    // threshold = 0.5 -> pass = true.
+    let query = "CALL algo.RecallCert([10, 11, 10, 11], [30, 30, 30, 40], 'LINK', 2, 0.5) YIELD reached, total, recall, pass";
+    let res = shard
+        .execute_cypher_rows(QueryContext::new("cell-a", "dup-test"), query)
+        .await
+        .unwrap();
+    assert_eq!(res.rows[0].values[0], QueryValue::Count(1));
+    assert_eq!(res.rows[0].values[1], QueryValue::Count(2));
+    assert_eq!(res.rows[0].values[2], QueryValue::Float(QueryFloat(0.5)));
+    assert_eq!(res.rows[0].values[3], QueryValue::Bool(true));
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn recall_cert_zero_labels_empty_inputs_and_bounds() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/recall-cert-empty-inputs";
+    let shard = open_test_shard(path, object_store).await;
+
+    shard
+        .write_edge(typed_mutation("cell-a", "LINK", 1, 2, "e1"))
+        .await
+        .unwrap();
+
+    // Zero labels with threshold 0.5 -> reached = 0, total = 0, recall = 0.0, pass = false
+    let q_zero_labels =
+        "CALL algo.RecallCert([1], [], 'LINK', 2, 0.5) YIELD reached, total, recall, pass";
+    let r_zero = shard
+        .execute_cypher_rows(QueryContext::new("cell-a", "zero-labels"), q_zero_labels)
+        .await
+        .unwrap();
+    assert_eq!(r_zero.rows[0].values[0], QueryValue::Count(0));
+    assert_eq!(r_zero.rows[0].values[1], QueryValue::Count(0));
+    assert_eq!(r_zero.rows[0].values[2], QueryValue::Float(QueryFloat(0.0)));
+    assert_eq!(r_zero.rows[0].values[3], QueryValue::Bool(false));
+
+    // Zero labels with threshold 0.0 -> reached = 0, total = 0, recall = 0.0, pass = true (0.0 >= 0.0)
+    let q_zero_thresh =
+        "CALL algo.RecallCert([1], [], 'LINK', 2, 0.0) YIELD reached, total, recall, pass";
+    let r_thresh = shard
+        .execute_cypher_rows(QueryContext::new("cell-a", "zero-thresh"), q_zero_thresh)
+        .await
+        .unwrap();
+    assert_eq!(r_thresh.rows[0].values[0], QueryValue::Count(0));
+    assert_eq!(r_thresh.rows[0].values[1], QueryValue::Count(0));
+    assert_eq!(
+        r_thresh.rows[0].values[2],
+        QueryValue::Float(QueryFloat(0.0))
+    );
+    assert_eq!(r_thresh.rows[0].values[3], QueryValue::Bool(true));
+
+    // Empty sources with non-empty labels -> reached = 0, total = 2, recall = 0.0, pass = false
+    let q_empty_src =
+        "CALL algo.RecallCert([], [1, 2], 'LINK', 2, 0.5) YIELD reached, total, recall, pass";
+    let r_src = shard
+        .execute_cypher_rows(QueryContext::new("cell-a", "empty-src"), q_empty_src)
+        .await
+        .unwrap();
+    assert_eq!(r_src.rows[0].values[0], QueryValue::Count(0));
+    assert_eq!(r_src.rows[0].values[1], QueryValue::Count(2));
+    assert_eq!(r_src.rows[0].values[2], QueryValue::Float(QueryFloat(0.0)));
+    assert_eq!(r_src.rows[0].values[3], QueryValue::Bool(false));
+
+    // maxLen = 0 -> cannot traverse, reached = 0, total = 1, recall = 0.0, pass = false
+    let q_len_zero =
+        "CALL algo.RecallCert([1], [2], 'LINK', 0, 0.5) YIELD reached, total, recall, pass";
+    let r_len0 = shard
+        .execute_cypher_rows(QueryContext::new("cell-a", "len-0"), q_len_zero)
+        .await
+        .unwrap();
+    assert_eq!(r_len0.rows[0].values[0], QueryValue::Count(0));
+    assert_eq!(r_len0.rows[0].values[1], QueryValue::Count(1));
+    assert_eq!(r_len0.rows[0].values[2], QueryValue::Float(QueryFloat(0.0)));
+    assert_eq!(r_len0.rows[0].values[3], QueryValue::Bool(false));
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn recall_cert_count_star_and_projections() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/recall-cert-count-star";
+    let shard = open_test_shard(path, object_store).await;
+
+    shard
+        .write_edge(typed_mutation("cell-a", "LINK", 1, 2, "e1"))
+        .await
+        .unwrap();
+
+    // execute_cypher returning QueryOutput::Count(1)
+    let q_count =
+        "CALL algo.RecallCert([1], [2], 'LINK', 1, 0.5) YIELD reached, total RETURN count(*)";
+    let out = shard
+        .execute_cypher(QueryContext::new("cell-a", "count-cypher"), q_count)
+        .await
+        .unwrap();
+    assert_eq!(out, QueryOutput::Count(1));
+
+    // execute_cypher_rows returning count(*) AS total_rows
+    let q_count_alias = "CALL algo.RecallCert([1], [2], 'LINK', 1, 0.5) YIELD reached, total RETURN count(*) AS total_rows";
+    let rows_res = shard
+        .execute_cypher_rows(QueryContext::new("cell-a", "count-rows"), q_count_alias)
+        .await
+        .unwrap();
+    let count_cols: Vec<&str> = rows_res.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(count_cols, vec!["total_rows"]);
+    assert_eq!(rows_res.rows.len(), 1);
+    assert_eq!(rows_res.rows[0].values, vec![QueryValue::Count(1)]);
+
+    // Projection subset with alias: RETURN recall AS score, pass
+    let q_proj = "CALL algo.RecallCert([1], [2], 'LINK', 1, 0.5) YIELD reached, recall, pass RETURN recall AS score, pass";
+    let proj_res = shard
+        .execute_cypher_rows(QueryContext::new("cell-a", "proj-alias"), q_proj)
+        .await
+        .unwrap();
+    let proj_cols: Vec<&str> = proj_res.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(proj_cols, vec!["score", "pass"]);
+    assert_eq!(proj_res.rows.len(), 1);
+    assert_eq!(
+        proj_res.rows[0].values[0],
+        QueryValue::Float(QueryFloat(1.0))
+    );
+    assert_eq!(proj_res.rows[0].values[1], QueryValue::Bool(true));
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn recall_cert_map_syntax_and_query_parameters() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/recall-cert-map-and-params";
+    let shard = open_test_shard(path, object_store).await;
+
+    shard
+        .write_edge(typed_mutation("cell-a", "ROUTE", 10, 20, "e1"))
+        .await
+        .unwrap();
+
+    // Map syntax:
+    let q_map = "CALL algo.RecallCert({sourceNodes: [10], labelNodes: [20], relType: 'ROUTE', maxLen: 1, threshold: 0.99}) YIELD reached, recall, pass";
+    let r_map = shard
+        .execute_cypher_rows(QueryContext::new("cell-a", "map-syntax"), q_map)
+        .await
+        .unwrap();
+    let map_cols: Vec<&str> = r_map.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(map_cols, vec!["reached", "recall", "pass"]);
+    assert_eq!(r_map.rows[0].values[0], QueryValue::Count(1));
+    assert_eq!(r_map.rows[0].values[1], QueryValue::Float(QueryFloat(1.0)));
+    assert_eq!(r_map.rows[0].values[2], QueryValue::Bool(true));
+
+    // Parameterized call:
+    let q_param = "CALL algo.RecallCert($sources, $labels, $rel, $len, $thresh) YIELD reached, total, recall, pass";
+    let ctx = QueryContext::new("cell-a", "param-call")
+        .with_list_parameters([
+            (
+                "sources".to_string(),
+                vec![VertexPropertyValue::Integer(10)],
+            ),
+            ("labels".to_string(), vec![VertexPropertyValue::Integer(20)]),
+        ])
+        .with_parameters([
+            (
+                "rel".to_string(),
+                VertexPropertyValue::String("ROUTE".to_string()),
+            ),
+            ("len".to_string(), VertexPropertyValue::Integer(1)),
+            (
+                "thresh".to_string(),
+                VertexPropertyValue::Float(QueryFloat(1.0)),
+            ),
+        ]);
+    let r_param = shard.execute_cypher_rows(ctx, q_param).await.unwrap();
+    assert_eq!(r_param.rows[0].values[0], QueryValue::Count(1));
+    assert_eq!(r_param.rows[0].values[1], QueryValue::Count(1));
+    assert_eq!(
+        r_param.rows[0].values[2],
+        QueryValue::Float(QueryFloat(1.0))
+    );
+    assert_eq!(r_param.rows[0].values[3], QueryValue::Bool(true));
+
+    shard.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn recall_cert_compiled_csc_graph_index_and_storage_overlay() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/recall-cert-compiled-overlay";
+    let writer = open_test_shard(path, Arc::clone(&object_store)).await;
+
+    // 1 -> 2 in base snapshot
+    writer
+        .write_edge(typed_mutation("cell-a", "CHAIN", 1, 2, "base-1-2"))
+        .await
+        .unwrap();
+
+    // Indexer builds CSC index
+    let indexer = GraphShard::open(path, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    indexer.refresh_storage_sequence("cell-a").await.unwrap();
+    indexer.build_graph_index("cell-a", "CHAIN").await.unwrap();
+
+    // 2 -> 3 in WAL overlay (after index built)
+    writer
+        .write_edge(typed_mutation("cell-a", "CHAIN", 2, 3, "overlay-2-3"))
+        .await
+        .unwrap();
+
+    // Reader sees both index and overlay
+    let reader = GraphShard::open(path, Arc::clone(&object_store))
+        .await
+        .unwrap();
+    reader.refresh_storage_sequence("cell-a").await.unwrap();
+
+    // 1 -> 2 (from compiled index) -> 3 (from overlay) within 2 hops!
+    let query =
+        "CALL algo.RecallCert([1], [3], 'CHAIN', 2, 1.0) YIELD reached, total, recall, pass";
+    let res = reader
+        .execute_cypher_rows(QueryContext::new("cell-a", "compiled-overlay"), query)
+        .await
+        .unwrap();
+    assert_eq!(res.rows[0].values[0], QueryValue::Count(1));
+    assert_eq!(res.rows[0].values[1], QueryValue::Count(1));
+    assert_eq!(res.rows[0].values[2], QueryValue::Float(QueryFloat(1.0)));
+    assert_eq!(res.rows[0].values[3], QueryValue::Bool(true));
+
+    reader.close().await.unwrap();
+    indexer.close().await.unwrap();
+    writer.close().await.unwrap();
+}
+
+#[cfg(feature = "opencypher")]
+#[tokio::test]
+async fn recall_cert_traversal_scan_edge_budget_enforced() {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = "graph/recall-cert-scan-budget";
+    let writer = open_test_shard(path, Arc::clone(&object_store)).await;
+
+    // 1 -> 2, 1 -> 3, 1 -> 4 (3 edges out of node 1)
+    writer
+        .write_edge(typed_mutation("cell-a", "EDGE", 1, 2, "e1"))
+        .await
+        .unwrap();
+    writer
+        .write_edge(typed_mutation("cell-a", "EDGE", 1, 3, "e2"))
+        .await
+        .unwrap();
+    writer
+        .write_edge(typed_mutation("cell-a", "EDGE", 1, 4, "e3"))
+        .await
+        .unwrap();
+
+    let reader = GraphShard::open_with_limits(
+        path,
+        object_store,
+        GraphLimits {
+            max_query_scan_edges: 2,
+            ..GraphLimits::default()
+        },
+    )
+    .await
+    .unwrap();
+    reader.refresh_storage_sequence("cell-a").await.unwrap();
+
+    // Traversing all edges from 1 will encounter 3 edges, which exceeds max_query_scan_edges = 2
+    let query = "CALL algo.RecallCert([1], [4], 'EDGE', 1, 0.5) YIELD reached";
+    let error = reader
+        .execute_cypher_rows(QueryContext::new("cell-a", "scan-limit"), query)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        GraphError::AdmissionRejected {
+            operation: "native_path_edges",
+            actual: 3,
+            limit: 2,
+        }
+    ));
+
+    reader.close().await.unwrap();
+    writer.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn graphblas_wal_tail_resolves_edges_at_the_pinned_snapshot() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());

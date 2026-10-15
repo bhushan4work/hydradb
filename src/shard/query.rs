@@ -439,6 +439,21 @@ impl GraphShard {
         if context.cypher_engine == CypherEngineMode::Experimental {
             #[cfg(feature = "opencypher")]
             {
+                if let Some(procedure) = crate::query::path_procedure::parse_recall_cert_procedure(
+                    query,
+                    &context.parameters,
+                    &context.list_parameters,
+                    self.limits.max_traversal_hops,
+                )? {
+                    self.operation_metrics
+                        .record_cypher_route(CypherRoute::NativePathFallback);
+                    if procedure.is_count_all() {
+                        return Ok(QueryOutput::Count(1));
+                    }
+                    return Box::pin(self.execute_recall_cert_rows(context, procedure))
+                        .await
+                        .map(QueryOutput::Rows);
+                }
                 if let Some(procedure) = crate::query::path_procedure::parse_native_path_procedure(
                     query,
                     &context.parameters,
@@ -481,6 +496,16 @@ impl GraphShard {
         if context.cypher_engine == CypherEngineMode::Experimental {
             #[cfg(feature = "opencypher")]
             {
+                if let Some(procedure) = crate::query::path_procedure::parse_recall_cert_procedure(
+                    query,
+                    &context.parameters,
+                    &context.list_parameters,
+                    self.limits.max_traversal_hops,
+                )? {
+                    self.operation_metrics
+                        .record_cypher_route(CypherRoute::NativePathFallback);
+                    return Box::pin(self.execute_recall_cert_rows(context, procedure)).await;
+                }
                 if let Some(procedure) = crate::query::path_procedure::parse_native_path_procedure(
                     query,
                     &context.parameters,
@@ -537,6 +562,19 @@ impl GraphShard {
         if context.cypher_engine == CypherEngineMode::Experimental {
             #[cfg(feature = "opencypher")]
             {
+                if let Some(procedure) = crate::query::path_procedure::parse_recall_cert_procedure(
+                    query,
+                    &context.parameters,
+                    &context.list_parameters,
+                    self.limits.max_traversal_hops,
+                )? {
+                    self.operation_metrics
+                        .record_cypher_route(CypherRoute::NativePathFallback);
+                    return Box::pin(
+                        self.execute_recall_cert_rows_page(context, procedure, cursor, page_size),
+                    )
+                    .await;
+                }
                 if let Some(procedure) = crate::query::path_procedure::parse_native_path_procedure(
                     query,
                     &context.parameters,
@@ -589,6 +627,19 @@ impl GraphShard {
     ) -> Result<QueryOutput> {
         #[cfg(feature = "opencypher")]
         {
+            if let Some(procedure) = crate::query::path_procedure::parse_recall_cert_procedure(
+                query,
+                &context.parameters,
+                &context.list_parameters,
+                self.limits.max_traversal_hops,
+            )? {
+                if procedure.is_count_all() {
+                    return Ok(QueryOutput::Count(1));
+                }
+                return Box::pin(self.execute_recall_cert_rows(context, procedure))
+                    .await
+                    .map(QueryOutput::Rows);
+            }
             if let Some(procedure) = crate::query::path_procedure::parse_native_path_procedure(
                 query,
                 &context.parameters,
@@ -638,6 +689,14 @@ impl GraphShard {
     ) -> Result<QueryResultSet> {
         #[cfg(feature = "opencypher")]
         {
+            if let Some(procedure) = crate::query::path_procedure::parse_recall_cert_procedure(
+                query,
+                &context.parameters,
+                &context.list_parameters,
+                self.limits.max_traversal_hops,
+            )? {
+                return Box::pin(self.execute_recall_cert_rows(context, procedure)).await;
+            }
             if let Some(procedure) = crate::query::path_procedure::parse_native_path_procedure(
                 query,
                 &context.parameters,
@@ -676,6 +735,17 @@ impl GraphShard {
     ) -> Result<QueryResultPage> {
         #[cfg(feature = "opencypher")]
         {
+            if let Some(procedure) = crate::query::path_procedure::parse_recall_cert_procedure(
+                query,
+                &context.parameters,
+                &context.list_parameters,
+                self.limits.max_traversal_hops,
+            )? {
+                return Box::pin(
+                    self.execute_recall_cert_rows_page(context, procedure, cursor, page_size),
+                )
+                .await;
+            }
             if let Some(procedure) = crate::query::path_procedure::parse_native_path_procedure(
                 query,
                 &context.parameters,
